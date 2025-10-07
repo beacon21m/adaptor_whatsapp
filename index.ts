@@ -270,6 +270,7 @@ async function initDb() {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_refid_unique ON outbox(refId) WHERE refId IS NOT NULL;
   `);
   try {
     const row = db.query<any>(`SELECT value FROM meta WHERE key = 'sse_offset_${NETWORK_ID}_${BOT_ID}'`).get();
@@ -469,8 +470,19 @@ function handleSSEEvent(chunk: string) {
       if (Number.isFinite(n)) eventIdNum = n;
     }
     if (eventIdNum != null && lastProcessedEventId != null && eventIdNum <= lastProcessedEventId) {
-      console.log('[wa] dedupe skip (eventId<=last)', { eventIdNum, lastProcessedEventId });
-      return;
+      // If refId present and unseen, accept despite older eventId (handles gateway epoch reset)
+      if (payload.refId) {
+        const seen = !!db?.query?.(`SELECT 1 FROM outbox WHERE refId=$r LIMIT 1`).get({ $r: payload.refId });
+        if (!seen) {
+          console.warn('[wa] eventId older than last, but refId unseen — accepting', { eventIdNum, lastProcessedEventId, refId: payload.refId });
+        } else {
+          console.log('[wa] dedupe skip (eventId<=last with seen refId)', { eventIdNum, lastProcessedEventId });
+          return;
+        }
+      } else {
+        console.log('[wa] dedupe skip (eventId<=last)', { eventIdNum, lastProcessedEventId });
+        return;
+      }
     }
     const to = payload.groupId || payload.userId;
     if (!to) {
