@@ -1,0 +1,60 @@
+# Node/Bun dependencies
+node_modules/
+bun.lockb
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+
+# Builds and caches
+dist/
+build/
+.cache/
+.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# Env and local config
+.env
+.env.*
+!.env.example
+
+# Logs and diagnostics
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# WhatsApp Web / wwebjs data
+.wwebjs_auth/
+.wwebjs_cache/
+.wwebjs_*/
+session-*/
+
+# Puppeteer/Chromium user data profiles (if configured)
+puppeteer_profile/
+UserData*/
+ChromeUserData*/
+
+# Local runtime state
+.state/
+
+# Puppeteer/Chromium artifacts
+.local-chromium/
+chrome-data/
+
+# Coverage
+coverage/
+
+# Archives
+*.tgz
