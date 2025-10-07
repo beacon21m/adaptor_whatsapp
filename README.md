@@ -74,17 +74,18 @@
     - Send via `client.sendMessage(to, message, { quotedMessageId })`.
 
 **De‑Duplication**
-- Rationale: SSE reconnects, server replays, or at‑least‑once delivery may cause duplicates.
-- Strategy:
-  - Payload‑hash cache (in memory):
-    - Key = `${to}|${replyMessageId||''}|${message}`
-    - Hash with FNV‑1a (fast 32‑bit), store in `Map` with timestamp.
-    - On new outbound payload: if hash present and fresh (within `DEDUP_TTL_MS`), skip.
-    - Evict oldest when size exceeds `DEDUP_MAX`.
-  - Persistent anchor (across restarts):
-    - After scheduling a send, write the last hash to `.state/last_out_${NETWORK_ID}_${BOT_ID}.json`.
-    - On startup, pre‑seed the dedupe cache with this hash to avoid re‑sending the very last message seen before shutdown.
-- Optional extension (not enabled here but easy to add): track SSE `id` and skip events with `id <= lastSeenId`.
+- Rationale: SSE reconnects, server replays, or at‑least‑once delivery may cause duplicates. The gateway now includes `eventId` (monotonic per channel) and `refId` in each payload.
+- Strategy (preferred):
+  - Primary: eventId checkpoint
+    - Read `payload.eventId` (fallback to numeric SSE `id:` header if needed).
+    - Keep `lastProcessedEventId` in memory and persist to `.state/sse_offset_${NETWORK_ID}_${BOT_ID}.json`.
+    - Skip any payload where `eventId <= lastProcessedEventId`.
+    - Send `Last-Event-ID` header on connect using the persisted value for seamless resume.
+  - Secondary: payload‑hash fallback (only when no `eventId` is present)
+    - Key = `${to}|${replyMessageId||''}|${message}` hashed by FNV‑1a.
+    - TTL window `DEDUP_TTL_MS` and LRU cap `DEDUP_MAX`.
+    - Optional persistence of the last seen hash to avoid re‑sending a single message across restarts.
+  - Do not dedupe based solely on text; identical messages with different `eventId` must both deliver.
 
 **Resilience**
 - WhatsApp readiness:
@@ -125,4 +126,3 @@
 - ECONNRESET on SSE: typically the server rotated or a second subscriber attached. The adaptor auto‑reconnects with backoff.
 - Not sending immediately after start: expected until WhatsApp client emits `ready`; outbound messages queue and then flush.
 - Invalid target: ensure JIDs end with `@c.us` (DM) or `@g.us` (group) and match your WhatsApp number format.
-

@@ -41,6 +41,8 @@ type OutboundSSE = {
   replyMessageId?: string;
   message: string;
   direction?: 'in' | 'out' | string;
+  eventId?: number;
+  refId?: string;
 };
 
 // -------- Env helpers --------
@@ -145,13 +147,18 @@ async function safeText(res: Response): Promise<string> {
 
 // -------- Outbound: SSE subscribe -> WA send --------
 let sseAbort: AbortController | null = null;
-let lastEventId: string | null = null;
+let lastProcessedEventId: number | null = null;
 let sseRetryDelay = 1500; // ms, exponential backoff up to 30s
+let lastSseActivity = Date.now();
+const SSE_CHECK_INTERVAL_MS = Number(env('SSE_CHECK_INTERVAL_MS', '1000'));
+const SSE_STALE_MS = Number(env('SSE_STALE_MS', '10000'));
+let sseHealthTimer: ReturnType<typeof setInterval> | null = null;
 
 // -------- Dedupe cache (payload-hash) --------
 type CachedHit = { t: number };
 const dedupeCache = new Map<string, CachedHit>();
 const LAST_HASH_FILE = path.join(STATE_DIR, `last_out_${NETWORK_ID}_${BOT_ID}.json`);
+const OFFSET_FILE = path.join(STATE_DIR, `sse_offset_${NETWORK_ID}_${BOT_ID}.json`);
 
 function ensureStateDir() {
   try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch {}
@@ -209,6 +216,26 @@ function loadLastHash() {
   } catch {}
 }
 
+function persistOffset(eventId: number) {
+  try {
+    ensureStateDir();
+    fs.writeFileSync(OFFSET_FILE, JSON.stringify({ eventId, ts: Date.now() }));
+  } catch (e) {
+    console.warn('[wa] persist offset failed:', e);
+  }
+}
+
+function loadOffset() {
+  try {
+    const txt = fs.readFileSync(OFFSET_FILE, 'utf8');
+    const obj = JSON.parse(txt);
+    if (typeof obj?.eventId === 'number' && isFinite(obj.eventId)) {
+      lastProcessedEventId = obj.eventId;
+      console.log('[wa] loaded lastProcessedEventId:', lastProcessedEventId);
+    }
+  } catch {}
+}
+
 async function startSSE() {
   const url = `${BASE}/api/messages/out/${encodeURIComponent(NETWORK_ID)}/${encodeURIComponent(BOT_ID)}`;
   const ac = new AbortController();
@@ -220,7 +247,7 @@ async function startSSE() {
       method: 'GET',
       headers: {
         accept: 'text/event-stream',
-        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+        ...(lastProcessedEventId != null ? { 'Last-Event-ID': String(lastProcessedEventId) } : {}),
       },
       signal: ac.signal,
     }, { verbose: true } as any);
@@ -232,10 +259,13 @@ async function startSSE() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    lastSseActivity = Date.now();
+    startSseHealthCheck();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
+      lastSseActivity = Date.now();
       let idx;
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const rawEvent = buffer.slice(0, idx);
@@ -256,17 +286,17 @@ async function startSSE() {
 }
 
 function handleSSEEvent(chunk: string) {
+  lastSseActivity = Date.now();
   let event: string | null = null;
   let data: string[] = [];
-  let id: string | null = null;
+  let idHeader: string | null = null;
   const lines = chunk.split(/\r?\n/);
   for (const line of lines) {
     if (!line || line.startsWith(':')) continue; // comment/heartbeat
     if (line.startsWith('event:')) event = line.slice(6).trim();
     else if (line.startsWith('data:')) data.push(line.slice(5).trim());
-    else if (line.startsWith('id:')) id = line.slice(3).trim();
+    else if (line.startsWith('id:')) idHeader = line.slice(3).trim();
   }
-  if (id) lastEventId = id;
 
   // If server omits 'event', SSE defaults to 'message'
   if (!event) event = 'message';
@@ -283,6 +313,19 @@ function handleSSEEvent(chunk: string) {
     if (payload.direction && payload.direction !== 'out') {
       return;
     }
+
+    // Determine eventId (prefer data.eventId, fallback to numeric SSE id header)
+    let eventIdNum: number | null = null;
+    if (typeof payload.eventId === 'number' && isFinite(payload.eventId)) {
+      eventIdNum = payload.eventId;
+    } else if (idHeader != null) {
+      const n = Number(idHeader);
+      if (Number.isFinite(n)) eventIdNum = n;
+    }
+    if (eventIdNum != null && lastProcessedEventId != null && eventIdNum <= lastProcessedEventId) {
+      console.log('[wa] dedupe skip (eventId<=last)', { eventIdNum, lastProcessedEventId });
+      return;
+    }
     const to = payload.groupId || payload.userId;
     if (!to) {
       console.warn('[wa] outbound has no target (userId/groupId)');
@@ -291,11 +334,15 @@ function handleSSEEvent(chunk: string) {
     const opts: any = {};
     if (payload.replyMessageId) opts.quotedMessageId = payload.replyMessageId;
 
-    const key = payloadKey(to, payload.message || '', payload.replyMessageId);
-    const hash = fnv1a(key);
-    if (dedupeSeen(hash)) {
-      console.log('[wa] dedupe skip (hash)');
-      return;
+    // Only use payload-hash dedupe when no eventId present
+    let hash: string | null = null;
+    if (eventIdNum == null) {
+      const key = payloadKey(to, payload.message || '', payload.replyMessageId);
+      hash = fnv1a(key);
+      if (dedupeSeen(hash)) {
+        console.log('[wa] dedupe skip (hash)');
+        return;
+      }
     }
 
     console.log('[wa] outbound ->', { to, hasReply: !!payload.replyMessageId, preview: payload.message?.slice(0, 80) });
@@ -308,8 +355,13 @@ function handleSSEEvent(chunk: string) {
     } else {
       send();
     }
-    // persist last delivered hash so restarts don't re-send last event
-    persistLastHash(hash);
+    // Advance/persist primary offset, else persist last-hash as fallback
+    if (eventIdNum != null) {
+      lastProcessedEventId = eventIdNum;
+      persistOffset(eventIdNum);
+    } else if (hash) {
+      persistLastHash(hash);
+    }
   } catch (e) {
     console.warn('[wa] SSE parse error:', e);
   }
@@ -317,9 +369,25 @@ function handleSSEEvent(chunk: string) {
 
 function delay(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
+function startSseHealthCheck() {
+  if (sseHealthTimer) return;
+  sseHealthTimer = setInterval(() => {
+    const now = Date.now();
+    if (now - lastSseActivity > SSE_STALE_MS) {
+      console.warn('[wa] SSE appears stale; restarting connection');
+      try { sseAbort?.abort(); } catch {}
+      sseAbort = null;
+      lastSseActivity = now;
+      sseRetryDelay = 1500;
+      startSSE();
+    }
+  }, SSE_CHECK_INTERVAL_MS);
+}
+
 // -------- Start --------
 (async () => {
   console.log('[wa] adaptor starting with', { BASE, BOT_TYPE, BOT_ID, NETWORK_ID });
+  loadOffset();
   loadLastHash();
   client.initialize().catch((err) => console.error('[wa] init failed:', err));
   // start SSE after a small delay to allow login; it will also work before login
