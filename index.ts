@@ -331,10 +331,9 @@ function dbSetOffset(n: number) {
 function upsertOutbox(eventId: number, refId: string | undefined, toJid: string, message: string, replyMessageId?: string) {
   const now = Date.now();
   if (refId) {
-    // Idempotent on refId if present
-    db.query(`INSERT INTO outbox(eventId, refId, toJid, message, replyMessageId, state, attempts, createdAt, updatedAt)
-              VALUES($eventId, $refId, $toJid, $message, $replyMessageId, 'queued', 0, $now, $now)
-              ON CONFLICT(refId) DO NOTHING`)
+    // Idempotent on refId if present (unique index). Use INSERT OR IGNORE for partial unique index compatibility.
+    db.query(`INSERT OR IGNORE INTO outbox(eventId, refId, toJid, message, replyMessageId, state, attempts, createdAt, updatedAt)
+              VALUES($eventId, $refId, $toJid, $message, $replyMessageId, 'queued', 0, $now, $now)`)
       .run({ $eventId: eventId ?? null, $refId: refId, $toJid: toJid, $message: message, $replyMessageId: replyMessageId ?? null, $now: now });
   } else {
     // No refId; allow duplicates by inserting separate rows (dedupe is handled elsewhere)
