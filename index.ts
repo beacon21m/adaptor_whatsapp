@@ -236,6 +236,141 @@ function loadOffset() {
   } catch {}
 }
 
+// -------- SQLite durable outbox --------
+let db: Database;
+function initDb() {
+  ensureStateDir();
+  db = new Database(DB_FILE);
+  db.exec(`
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS outbox (
+      eventId INTEGER PRIMARY KEY,
+      refId TEXT,
+      toJid TEXT NOT NULL,
+      message TEXT NOT NULL,
+      replyMessageId TEXT,
+      state TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      providerMsgId TEXT,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+  `);
+  try {
+    const row = db.query<{ value: string }>(`SELECT value FROM meta WHERE key = 'sse_offset_${NETWORK_ID}_${BOT_ID}'`).get();
+    if (row?.value) {
+      const n = Number(row.value);
+      if (Number.isFinite(n)) {
+        lastProcessedEventId = n;
+        console.log('[wa] loaded lastProcessedEventId from db:', n);
+      }
+    }
+  } catch {}
+}
+
+function dbSetOffset(n: number) {
+  lastProcessedEventId = n;
+  db.query(`INSERT INTO meta(key,value) VALUES($k,$v)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value`) 
+    .run({ $k: `sse_offset_${NETWORK_ID}_${BOT_ID}`, $v: String(n) });
+}
+
+function upsertOutbox(eventId: number, refId: string | undefined, toJid: string, message: string, replyMessageId?: string) {
+  const now = Date.now();
+  db.query(`INSERT INTO outbox(eventId, refId, toJid, message, replyMessageId, state, attempts, createdAt, updatedAt)
+            VALUES($eventId, $refId, $toJid, $message, $replyMessageId, 'queued', 0, $now, $now)
+            ON CONFLICT(eventId) DO NOTHING`)
+    .run({ $eventId: eventId, $refId: refId ?? null, $toJid: toJid, $message: message, $replyMessageId: replyMessageId ?? null, $now: now });
+}
+
+const DISPATCH_CONCURRENCY = Number(env('DISPATCH_CONCURRENCY', '3'));
+const SEND_TIMEOUT_MS = Number(env('SEND_TIMEOUT_MS', '20000'));
+let inFlight = 0;
+let dispatcherStarted = false;
+
+function startDispatcher() {
+  if (dispatcherStarted) return;
+  dispatcherStarted = true;
+  setInterval(async () => {
+    try {
+      if (!waReady) return;
+      while (inFlight < DISPATCH_CONCURRENCY) {
+        const row = db.query<any>(`SELECT * FROM outbox WHERE state IN ('queued','retry') ORDER BY eventId ASC LIMIT 1`).get();
+        if (!row) break;
+        db.query(`UPDATE outbox SET state='sending', updatedAt=$now WHERE eventId=$id`).run({ $now: Date.now(), $id: row.eventId });
+        inFlight++;
+        void sendOne(row).finally(() => { inFlight--; });
+      }
+    } catch (e) {
+      console.warn('[wa] dispatcher error:', e);
+    }
+  }, 300);
+}
+
+async function sendOne(row: any) {
+  const to = row.toJid as string;
+  const message = row.message as string;
+  const opts: any = {};
+  if (row.replyMessageId) opts.quotedMessageId = row.replyMessageId;
+  try {
+    const msg = await client.sendMessage(to, message || '', opts);
+    const providerMsgId = (msg as any)?.id?._serialized || (msg as any)?.id?.id;
+    db.query(`UPDATE outbox SET state='sent', providerMsgId=$pmid, updatedAt=$now WHERE eventId=$id`) 
+      .run({ $pmid: providerMsgId ?? null, $now: Date.now(), $id: row.eventId });
+    // fallback timeout to retry if no ack arrives in time
+    setTimeout(() => {
+      const stateRow = db.query<any>(`SELECT state, attempts FROM outbox WHERE eventId=$id`).get({ $id: row.eventId });
+      if (!stateRow || stateRow.state === 'acked') return;
+      const attempts = (stateRow?.attempts ?? 0) + 1;
+      const willRetry = attempts <= 5;
+      db.query(`UPDATE outbox SET state=$state, attempts=$att, updatedAt=$now WHERE eventId=$id`) 
+        .run({ $state: willRetry ? 'retry' : 'failed', $att: attempts, $now: Date.now(), $id: row.eventId });
+    }, SEND_TIMEOUT_MS);
+  } catch (e) {
+    const attempts = (row.attempts ?? 0) + 1;
+    const willRetry = attempts <= 5;
+    db.query(`UPDATE outbox SET state=$state, attempts=$att, updatedAt=$now WHERE eventId=$id`) 
+      .run({ $state: willRetry ? 'retry' : 'failed', $att: attempts, $now: Date.now(), $id: row.eventId });
+    console.error('[wa] sendOne error:', e);
+  }
+}
+
+client.on('message_ack', (msg, ack) => {
+  try {
+    const pmid = (msg as any)?.id?._serialized || (msg as any)?.id?.id;
+    if (!pmid) return;
+    if (typeof ack === 'number' && ack >= 1) {
+      const row = db.query<any>(`SELECT eventId FROM outbox WHERE providerMsgId=$pmid`).get({ $pmid: pmid });
+      if (!row) return;
+      db.query(`UPDATE outbox SET state='acked', updatedAt=$now WHERE eventId=$id`).run({ $now: Date.now(), $id: row.eventId });
+      advanceCheckpoint();
+    }
+  } catch (e) {
+    console.warn('[wa] message_ack handler error:', e);
+  }
+});
+
+function advanceCheckpoint() {
+  try {
+    let next = (lastProcessedEventId ?? 0) + 1;
+    while (true) {
+      const row = db.query<any>(`SELECT state FROM outbox WHERE eventId=$id`).get({ $id: next });
+      if (!row || row.state !== 'acked') break;
+      dbSetOffset(next);
+      next += 1;
+      if (next % 50 === 0) {
+        db.exec(`DELETE FROM outbox WHERE eventId < ${next - 100} AND state='acked'`);
+      }
+    }
+  } catch (e) {
+    console.warn('[wa] advanceCheckpoint error:', e);
+  }
+}
+
 async function startSSE() {
   const url = `${BASE}/api/messages/out/${encodeURIComponent(NETWORK_ID)}/${encodeURIComponent(BOT_ID)}`;
   const ac = new AbortController();
@@ -345,22 +480,22 @@ function handleSSEEvent(chunk: string) {
       }
     }
 
-    console.log('[wa] outbound ->', { to, hasReply: !!payload.replyMessageId, preview: payload.message?.slice(0, 80) });
-    const send = () => client.sendMessage(to, payload.message || '', opts).catch((e) => {
-      console.error('[wa] sendMessage error:', e);
-    });
-    if (!waReady) {
-      outboundQueue.push({ to, message: payload.message || '', opts });
-      console.log('[wa] queued outbound (client not ready)');
-    } else {
-      send();
-    }
-    // Advance/persist primary offset, else persist last-hash as fallback
     if (eventIdNum != null) {
-      lastProcessedEventId = eventIdNum;
-      persistOffset(eventIdNum);
-    } else if (hash) {
-      persistLastHash(hash);
+      console.log('[wa] enqueue outbound ->', { to, hasReply: !!payload.replyMessageId, preview: payload.message?.slice(0, 80), eventId: eventIdNum });
+      upsertOutbox(eventIdNum, payload.refId, to, payload.message || '', payload.replyMessageId);
+      startDispatcher();
+    } else {
+      console.log('[wa] outbound (no eventId) ->', { to, hasReply: !!payload.replyMessageId, preview: payload.message?.slice(0, 80) });
+      const send = () => client.sendMessage(to, payload.message || '', opts).catch((e) => {
+        console.error('[wa] sendMessage error:', e);
+      });
+      if (!waReady) {
+        outboundQueue.push({ to, message: payload.message || '', opts });
+        console.log('[wa] queued outbound (client not ready)');
+      } else {
+        send();
+      }
+      if (hash) persistLastHash(hash);
     }
   } catch (e) {
     console.warn('[wa] SSE parse error:', e);
@@ -387,6 +522,7 @@ function startSseHealthCheck() {
 // -------- Start --------
 (async () => {
   console.log('[wa] adaptor starting with', { BASE, BOT_TYPE, BOT_ID, NETWORK_ID });
+  initDb();
   loadOffset();
   loadLastHash();
   client.initialize().catch((err) => console.error('[wa] init failed:', err));
