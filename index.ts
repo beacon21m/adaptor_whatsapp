@@ -21,6 +21,15 @@ import qrcode from 'qrcode-terminal';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 import fs from 'fs';
 import path from 'path';
+// Dynamic import for bun:sqlite to avoid runtime binding issues
+let DatabaseCtor: any;
+async function loadSqlite() {
+  if (!DatabaseCtor) {
+    const mod = await import('bun:sqlite');
+    // @ts-ignore
+    DatabaseCtor = (mod as any).Database;
+  }
+}
 
 type InboundPost = {
   networkId: string;
@@ -63,6 +72,7 @@ const EXECUTABLE_PATH = env('PUPPETEER_EXECUTABLE_PATH', env('CHROME_BIN')) || u
 const DEDUP_TTL_MS = Number(env('DEDUP_TTL_MS', '180000')); // 3 minutes default
 const DEDUP_MAX = Number(env('DEDUP_MAX', '500'));
 const STATE_DIR = env('STATE_DIR', '.state');
+const DB_FILE = path.join(STATE_DIR, 'state.sqlite');
 
 // -------- WhatsApp bootstrap --------
 const pupArgs = [
@@ -237,10 +247,11 @@ function loadOffset() {
 }
 
 // -------- SQLite durable outbox --------
-let db: Database;
-function initDb() {
+let db: any;
+async function initDb() {
+  await loadSqlite();
   ensureStateDir();
-  db = new Database(DB_FILE);
+  db = new DatabaseCtor(DB_FILE);
   db.exec(`
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS outbox (
@@ -261,7 +272,7 @@ function initDb() {
     );
   `);
   try {
-    const row = db.query<{ value: string }>(`SELECT value FROM meta WHERE key = 'sse_offset_${NETWORK_ID}_${BOT_ID}'`).get();
+    const row = db.query<any>(`SELECT value FROM meta WHERE key = 'sse_offset_${NETWORK_ID}_${BOT_ID}'`).get();
     if (row?.value) {
       const n = Number(row.value);
       if (Number.isFinite(n)) {
@@ -522,7 +533,7 @@ function startSseHealthCheck() {
 // -------- Start --------
 (async () => {
   console.log('[wa] adaptor starting with', { BASE, BOT_TYPE, BOT_ID, NETWORK_ID });
-  initDb();
+  await initDb();
   loadOffset();
   loadLastHash();
   client.initialize().catch((err) => console.error('[wa] init failed:', err));
