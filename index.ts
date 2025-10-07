@@ -255,7 +255,8 @@ async function initDb() {
   db.exec(`
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS outbox (
-      eventId INTEGER PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      eventId INTEGER,
       refId TEXT,
       toJid TEXT NOT NULL,
       message TEXT NOT NULL,
@@ -270,8 +271,44 @@ async function initDb() {
       key TEXT PRIMARY KEY,
       value TEXT
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_refid_unique ON outbox(refId) WHERE refId IS NOT NULL;
   `);
+  // Ensure indexes
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_refid_unique ON outbox(refId) WHERE refId IS NOT NULL;`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_eventId ON outbox(eventId);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_state_event ON outbox(state, eventId);`);
+  // Migrate legacy schema where eventId was PRIMARY KEY
+  try {
+    const cols = db.query<any>(`PRAGMA table_info(outbox)`).all();
+    const eventPk = cols?.find((c: any) => c.name === 'eventId')?.pk === 1;
+    if (eventPk) {
+      console.warn('[wa] migrating outbox schema (eventId PK -> id PK)');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS outbox_v2 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          eventId INTEGER,
+          refId TEXT,
+          toJid TEXT NOT NULL,
+          message TEXT NOT NULL,
+          replyMessageId TEXT,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          providerMsgId TEXT,
+          createdAt INTEGER NOT NULL,
+          updatedAt INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO outbox_v2(eventId, refId, toJid, message, replyMessageId, state, attempts, providerMsgId, createdAt, updatedAt)
+        SELECT eventId, refId, toJid, message, replyMessageId, state, attempts, providerMsgId, createdAt, updatedAt FROM outbox;
+        DROP TABLE outbox;
+        ALTER TABLE outbox_v2 RENAME TO outbox;
+      `);
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_refid_unique ON outbox(refId) WHERE refId IS NOT NULL;`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_eventId ON outbox(eventId);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_state_event ON outbox(state, eventId);`);
+    }
+  } catch (e) {
+    console.warn('[wa] outbox schema check/migration skipped:', e);
+  }
+
   try {
     const row = db.query<any>(`SELECT value FROM meta WHERE key = 'sse_offset_${NETWORK_ID}_${BOT_ID}'`).get();
     if (row?.value) {
@@ -293,10 +330,18 @@ function dbSetOffset(n: number) {
 
 function upsertOutbox(eventId: number, refId: string | undefined, toJid: string, message: string, replyMessageId?: string) {
   const now = Date.now();
-  db.query(`INSERT INTO outbox(eventId, refId, toJid, message, replyMessageId, state, attempts, createdAt, updatedAt)
-            VALUES($eventId, $refId, $toJid, $message, $replyMessageId, 'queued', 0, $now, $now)
-            ON CONFLICT(eventId) DO NOTHING`)
-    .run({ $eventId: eventId, $refId: refId ?? null, $toJid: toJid, $message: message, $replyMessageId: replyMessageId ?? null, $now: now });
+  if (refId) {
+    // Idempotent on refId if present
+    db.query(`INSERT INTO outbox(eventId, refId, toJid, message, replyMessageId, state, attempts, createdAt, updatedAt)
+              VALUES($eventId, $refId, $toJid, $message, $replyMessageId, 'queued', 0, $now, $now)
+              ON CONFLICT(refId) DO NOTHING`)
+      .run({ $eventId: eventId ?? null, $refId: refId, $toJid: toJid, $message: message, $replyMessageId: replyMessageId ?? null, $now: now });
+  } else {
+    // No refId; allow duplicates by inserting separate rows (dedupe is handled elsewhere)
+    db.query(`INSERT INTO outbox(eventId, refId, toJid, message, replyMessageId, state, attempts, createdAt, updatedAt)
+              VALUES($eventId, NULL, $toJid, $message, $replyMessageId, 'queued', 0, $now, $now)`)
+      .run({ $eventId: eventId ?? null, $toJid: toJid, $message: message, $replyMessageId: replyMessageId ?? null, $now: now });
+  }
 }
 
 const DISPATCH_CONCURRENCY = Number(env('DISPATCH_CONCURRENCY', '3'));
@@ -311,9 +356,9 @@ function startDispatcher() {
     try {
       if (!waReady) return;
       while (inFlight < DISPATCH_CONCURRENCY) {
-        const row = db.query<any>(`SELECT * FROM outbox WHERE state IN ('queued','retry') ORDER BY eventId ASC LIMIT 1`).get();
+        const row = db.query<any>(`SELECT * FROM outbox WHERE state IN ('queued','retry') ORDER BY createdAt ASC LIMIT 1`).get();
         if (!row) break;
-        db.query(`UPDATE outbox SET state='sending', updatedAt=$now WHERE eventId=$id`).run({ $now: Date.now(), $id: row.eventId });
+        db.query(`UPDATE outbox SET state='sending', updatedAt=$now WHERE id=$id`).run({ $now: Date.now(), $id: row.id });
         inFlight++;
         void sendOne(row).finally(() => { inFlight--; });
       }
@@ -331,22 +376,22 @@ async function sendOne(row: any) {
   try {
     const msg = await client.sendMessage(to, message || '', opts);
     const providerMsgId = (msg as any)?.id?._serialized || (msg as any)?.id?.id;
-    db.query(`UPDATE outbox SET state='sent', providerMsgId=$pmid, updatedAt=$now WHERE eventId=$id`) 
-      .run({ $pmid: providerMsgId ?? null, $now: Date.now(), $id: row.eventId });
+    db.query(`UPDATE outbox SET state='sent', providerMsgId=$pmid, updatedAt=$now WHERE id=$id`) 
+      .run({ $pmid: providerMsgId ?? null, $now: Date.now(), $id: row.id });
     // fallback timeout to retry if no ack arrives in time
     setTimeout(() => {
-      const stateRow = db.query<any>(`SELECT state, attempts FROM outbox WHERE eventId=$id`).get({ $id: row.eventId });
+      const stateRow = db.query<any>(`SELECT state, attempts FROM outbox WHERE id=$id`).get({ $id: row.id });
       if (!stateRow || stateRow.state === 'acked') return;
       const attempts = (stateRow?.attempts ?? 0) + 1;
       const willRetry = attempts <= 5;
-      db.query(`UPDATE outbox SET state=$state, attempts=$att, updatedAt=$now WHERE eventId=$id`) 
-        .run({ $state: willRetry ? 'retry' : 'failed', $att: attempts, $now: Date.now(), $id: row.eventId });
+      db.query(`UPDATE outbox SET state=$state, attempts=$att, updatedAt=$now WHERE id=$id`) 
+        .run({ $state: willRetry ? 'retry' : 'failed', $att: attempts, $now: Date.now(), $id: row.id });
     }, SEND_TIMEOUT_MS);
   } catch (e) {
     const attempts = (row.attempts ?? 0) + 1;
     const willRetry = attempts <= 5;
-    db.query(`UPDATE outbox SET state=$state, attempts=$att, updatedAt=$now WHERE eventId=$id`) 
-      .run({ $state: willRetry ? 'retry' : 'failed', $att: attempts, $now: Date.now(), $id: row.eventId });
+    db.query(`UPDATE outbox SET state=$state, attempts=$att, updatedAt=$now WHERE id=$id`) 
+      .run({ $state: willRetry ? 'retry' : 'failed', $att: attempts, $now: Date.now(), $id: row.id });
     console.error('[wa] sendOne error:', e);
   }
 }
@@ -356,9 +401,9 @@ client.on('message_ack', (msg, ack) => {
     const pmid = (msg as any)?.id?._serialized || (msg as any)?.id?.id;
     if (!pmid) return;
     if (typeof ack === 'number' && ack >= 1) {
-      const row = db.query<any>(`SELECT eventId FROM outbox WHERE providerMsgId=$pmid`).get({ $pmid: pmid });
+      const row = db.query<any>(`SELECT id, eventId FROM outbox WHERE providerMsgId=$pmid`).get({ $pmid: pmid });
       if (!row) return;
-      db.query(`UPDATE outbox SET state='acked', updatedAt=$now WHERE eventId=$id`).run({ $now: Date.now(), $id: row.eventId });
+      db.query(`UPDATE outbox SET state='acked', updatedAt=$now WHERE id=$id`).run({ $now: Date.now(), $id: row.id });
       advanceCheckpoint();
     }
   } catch (e) {
@@ -368,15 +413,18 @@ client.on('message_ack', (msg, ack) => {
 
 function advanceCheckpoint() {
   try {
+    let advanced = false;
     let next = (lastProcessedEventId ?? 0) + 1;
     while (true) {
-      const row = db.query<any>(`SELECT state FROM outbox WHERE eventId=$id`).get({ $id: next });
+      const row = db.query<any>(`SELECT state FROM outbox WHERE eventId=$eid ORDER BY id ASC LIMIT 1`).get({ $eid: next });
       if (!row || row.state !== 'acked') break;
       dbSetOffset(next);
+      advanced = true;
       next += 1;
-      if (next % 50 === 0) {
-        db.exec(`DELETE FROM outbox WHERE eventId < ${next - 100} AND state='acked'`);
-      }
+    }
+    if (advanced) {
+      const cutoff = (lastProcessedEventId ?? 0) - 100;
+      if (cutoff > 0) db.exec(`DELETE FROM outbox WHERE eventId <= ${cutoff} AND state='acked'`);
     }
   } catch (e) {
     console.warn('[wa] advanceCheckpoint error:', e);
