@@ -4,8 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run index.ts",
-    "dev": "bun --hot run index.ts",
+    "start": "bun run index-compat.ts",
+    "start:improved": "bun run index-improved.ts",
+    "start:original": "bun run index.ts",
+    "dev": "bun --hot run index-compat.ts",
+    "dev:improved": "bun --hot run index-improved.ts",
+    "dev:original": "bun --hot run index.ts",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
